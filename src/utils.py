@@ -1,12 +1,12 @@
 """Utility file including methods for image decoding"""
 
-from typing import Union
 from io import BytesIO
+from typing import Union
+
+import numpy as np
 from PIL import Image
 from viam.logging import getLogger
-from viam.media.video import CameraMimeType
-from viam.media.video import ViamImage
-import numpy as np
+from viam.media.video import CameraMimeType, ViamImage
 
 LOGGER = getLogger(__name__)
 
@@ -17,12 +17,13 @@ SUPPORTED_IMAGE_TYPE = [
 ]
 LIBRARY_SUPPORTED_FORMATS = ["JPEG", "PNG", "VIAM_RGBA"]
 
+
 def decode_image(image: Union[Image.Image, ViamImage, np.ndarray]) -> np.ndarray:
-    """decode image to BGR numpy array
+    """decode image to RGB numpy array
     Args:
         raw_image (Union[Image.Image, RawImage])
     Returns:
-        np.ndarray: BGR numpy array
+        np.ndarray: RGB numpy array
     """
     if isinstance(image, np.ndarray):
         return image

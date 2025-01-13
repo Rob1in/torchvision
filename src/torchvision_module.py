@@ -1,35 +1,36 @@
 """Module that defines the Vision Service that wraps torchvision functionality"""
 
-from typing import ClassVar, List, Mapping, Sequence, Any, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Union
+
+import torch
+import torchvision
+from torch import Tensor
+from torchvision.models import Weights, get_model, get_model_weights, list_models
 from typing_extensions import Self
 from viam.components.camera import Camera
-from viam.media.video import ViamImage, CameraMimeType
-from viam.proto.service.vision import Classification, Detection
-from viam.services.vision import Vision, CaptureAllResult
+from viam.logging import getLogger
+from viam.media.video import CameraMimeType, ViamImage
 from viam.module.types import Reconfigurable
-from viam.resource.types import Model, ModelFamily
 from viam.proto.app.robot import ServiceConfig
 from viam.proto.common import PointCloudObject, ResourceName
+from viam.proto.service.vision import Classification, Detection
 from viam.resource.base import ResourceBase
+from viam.resource.types import Model, ModelFamily
+from viam.services.vision import CaptureAllResult, Vision
 from viam.utils import ValueTypes
-from viam.logging import getLogger
 
-from PIL import Image
-import torch
-from torch import Tensor
-import torchvision
-from torchvision.models import get_model, get_model_weights, list_models
-from torchvision.models import Weights
+from src.image import ImageObject
 from src.preprocess import Preprocessor
 from src.properties import Properties
-from src.utils import decode_image
 
 LOGGER = getLogger(__name__)
 
 DETECTION_MODELS: list = list_models(module=torchvision.models.detection)
 
+
 class TorchVisionService(Vision, Reconfigurable):
     """Torchvision Service class definition"""
+
     MODEL: ClassVar[Model] = Model(ModelFamily("viam", "vision"), "torchvision")
 
     def __init__(self, name: str):
@@ -53,13 +54,9 @@ class TorchVisionService(Vision, Reconfigurable):
         camera_name = config.attributes.fields["camera_name"].string_value
 
         if model_name == "":
-            raise Exception(
-                "A model name is required for this vision service module."
-            )
+            raise Exception("A model name is required for this vision service module.")
         if camera_name == "":
-            raise Exception(
-                "A camera name is required for this vision service module."
-            )
+            raise Exception("A camera name is required for this vision service module.")
         return [camera_name]
 
     def reconfigure(
@@ -98,22 +95,51 @@ class TorchVisionService(Vision, Reconfigurable):
                 return dict(config.attributes.fields[attribute_name].struct_value)
 
         model_name = get_attribute_from_config("model_name", None, str)
-        self.properties = Properties(
-            implements_classification=True,
-            implements_detection=False,
-            implements_get_object_pcd=False,
-        )
+        self.backend = get_attribute_from_config("backend", "cpu", str)
+        if self.backend == "mps":
+            if not torch.backends.mps.is_available():
+                if not torch.backends.mps.is_built():
+                    raise ValueError(
+                        "MPS not available because the current PyTorch install was not "
+                        "built with MPS enabled."
+                    )
+                else:
+                    raise ValueError(
+                        "MPS not available because the current MacOS version is not 12.3+ "
+                        "and/or you do not have an MPS-enabled device on this machine."
+                    )
+        self.device = torch.device(self.backend)
+
+        # self.properties = Properties(
+        #     implements_classification=True,
+        #     implements_detection=False,
+        #     implements_get_object_pcd=False,
+        # )
+
         if model_name in DETECTION_MODELS:
-            self.properties.implements_classification = False
-            self.properties.implements_detection = True
+            self.properties = Vision.Properties(
+                classifications_supported=False,
+                detections_supported=True,
+                object_point_clouds_supported=False,
+            )
+
+        else:
+            self.properties = Vision.Properties(
+                classifications_supported=True,
+                detections_supported=False,
+                object_point_clouds_supported=False,
+            )
 
         weights = get_attribute_from_config("weights", "DEFAULT")
         try:
-            self.model = get_model(model_name, weights=weights)
+            self.model = get_model(model_name, weights=weights).to(self.device)
         except KeyError as e:
             raise KeyError(
                 f"weights: {weights} are not availble for model: {model_name}"
             ) from e
+
+        self.model.eval()
+
         all_weights = get_model_weights(model_name)
         self.weights: Weights = getattr(all_weights, weights)
         input_size = get_attribute_from_config("input_size", None, list)
@@ -134,15 +160,12 @@ class TorchVisionService(Vision, Reconfigurable):
             channel_last=channel_last,
         )
 
-        self.model.eval()
-
-        self.labels_confidences = get_attribute_from_config(
-            "labels_confidences", {}
-        )
+        self.labels_confidences = get_attribute_from_config("labels_confidences", {})
         self.default_minimum_confidence = get_attribute_from_config(
-            "default_minimum_confidence", 0
+            "default_minimum_confidence", 0.5
         )
-    #pylint: disable=too-many-arguments
+
+    # pylint: disable=too-many-arguments
     async def capture_all_from_camera(
         self,
         camera_name: str,
@@ -173,26 +196,26 @@ class TorchVisionService(Vision, Reconfigurable):
 
         Args:
             camera_name (str): The name of the camera to use for detection
-            return_image (bool): 
+            return_image (bool):
                 Ask the vision service to return the camera's latest image
-            return_classifications (bool): 
+            return_classifications (bool):
                 Ask the vision service to return its latest classifications
-            return_detections (bool): 
+            return_detections (bool):
                 Ask the vision service to return its latest detections
-            return_object_point_clouds (bool): 
+            return_object_point_clouds (bool):
                 Ask the vision service to return its latest 3D segmentations
 
         Returns:
-            vision.CaptureAllResult: 
+            vision.CaptureAllResult:
                 A class that stores all potential returns from the vision service.
-            It can  return the image from the camera along with its associated detections, 
+            It can  return the image from the camera along with its associated detections,
             classifications, and objects, as well as any extra info the model may provide.
         """
         result = CaptureAllResult()
         image = await self.get_image_from_dependency(camera_name)
 
         if return_image:
-            result.image = image
+            result.image = image.viam_image
         if return_classifications:
             try:
                 classifications = await self.get_classifications(image, 1)
@@ -202,7 +225,9 @@ class TorchVisionService(Vision, Reconfigurable):
                 LOGGER.info(f"getClassifications failed: {e}")
         if return_detections:
             try:
-                detections = await self.get_detections(image, timeout=timeout, extra=None)
+                detections = await self.get_detections(
+                    image, timeout=timeout, extra=None
+                )
                 result.detections = detections
             # pylint: disable=broad-exception-caught
             except Exception as e:
@@ -219,44 +244,44 @@ class TorchVisionService(Vision, Reconfigurable):
         timeout: Optional[float] = None,
         **kwargs,
     ) -> List[PointCloudObject]:
-        if not self.properties.implements_get_object_pcd:
+        if not self.properties.object_point_clouds_supported:
             raise NotImplementedError
         return 1
 
     async def get_detections(
         self,
-        image: Union[Image.Image, ViamImage],
+        image: Union[ImageObject, ViamImage],
         *,
         extra: Mapping[str, Any],
         timeout: float,
     ) -> List[Detection]:
         """Get detections from an image"""
-        if not self.properties.implements_detection:
+        if not self.properties.detections_supported:
             raise NotImplementedError
-        LOGGER.info(f"input image is: {type(image)}")
-        image = decode_image(image)
-        input_tensor = self.preprocessor(image)
+        if isinstance(image, ViamImage):
+            image = ImageObject(image, device=self.device)
+        input_tensor = self.preprocessor(image.tensor)
         with torch.no_grad():
             prediction: Tensor = self.model(input_tensor)[0]
         return self.wrap_detections(prediction)
 
     async def get_classifications(
         self,
-        image: Union[Image.Image, ViamImage],
+        image: Union[ImageObject, ViamImage],
         count: int,
         *,
         extra: Optional[Mapping[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> List[Classification]:
         """Get classifications from image"""
-        if not self.properties.implements_classification:
+        if not self.properties.classifications_supported:
             return NotImplementedError
-        image = decode_image(image)
-        input_tensor = self.preprocessor(image)
+        if isinstance(image, ViamImage):
+            image = ImageObject(image, device=self.device)
+        input_tensor = self.preprocessor(image.tensor)
         with torch.no_grad():
             prediction: Tensor = self.model(input_tensor)
         out = self.wrap_classifications(prediction, count)
-        LOGGER.info(f"output: {type(out)}, {out}")
         return out
 
     async def get_classifications_from_camera(
@@ -268,11 +293,11 @@ class TorchVisionService(Vision, Reconfigurable):
         timeout: Optional[float] = None,
     ) -> List[Classification]:
         """Gets classifications from a camera dependency"""
-        if not self.properties.implements_classification:
+        if not self.properties.classifications_supported:
             raise NotImplementedError
 
         image = await self.get_image_from_dependency(camera_name)
-        input_tensor = self.preprocessor(image)
+        input_tensor = self.preprocessor(image.tensor)
         with torch.no_grad():
             prediction: Tensor = self.model(input_tensor)
         return self.wrap_classifications(prediction, count)
@@ -281,10 +306,9 @@ class TorchVisionService(Vision, Reconfigurable):
         self, camera_name: str, *, extra: Mapping[str, Any], timeout: float
     ) -> List[Detection]:
         """Gets detections from a camera dependency"""
-        if not self.properties.implements_detection:
+        if not self.properties.detections_supported:
             raise NotImplementedError
         image = await self.get_image_from_dependency(camera_name)
-        LOGGER.info(f"input image is: {type(image)}")
         input_tensor = self.preprocessor(image)
         with torch.no_grad():
             prediction: Tensor = self.model(input_tensor)[0]
@@ -297,9 +321,9 @@ class TorchVisionService(Vision, Reconfigurable):
         timeout: Optional[float] = None,
     ) -> Properties:
         """
-        Get info about what vision methods the vision service provides. 
+        Get info about what vision methods the vision service provides.
         Currently returns boolean values that
-        state whether the service implements the classification, detection, 
+        state whether the service implements the classification, detection,
         and/or 3D object segmentation methods.
 
         ::
@@ -339,10 +363,11 @@ class TorchVisionService(Vision, Reconfigurable):
 
         return res
 
-    async def get_image_from_dependency(self, camera_name: str):
+    async def get_image_from_dependency(self, camera_name: str) -> ImageObject:
         # cam = self.dependencies[Camera.get_resource_name("")]
         im = await self.camera.get_image(mime_type=CameraMimeType.JPEG)
-        return decode_image(im)
+        # return decode_image(im)
+        return ImageObject(im, device=self.device)
 
     def wrap_detections(self, prediction: dict):
         """_summary_
